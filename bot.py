@@ -13,7 +13,9 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     KeyboardButton,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
     ReplyKeyboardMarkup,
 )
 
@@ -27,6 +29,9 @@ REF_MAX = 50        # макс. засчитанных рефералов все
 AUTOBAN_AT = 5      # автобан после стольких жалоб от разных людей
 PAGE = 10           # фото на страницу
 USERS_PER_PAGE = 8  # пользователей на страницу в админ-панели
+
+# Тарифы VIP за Telegram Stars: {дней: цена в звёздах}. Меняй под себя.
+VIP_PLANS = {7: 50, 30: 150, 90: 350}
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
@@ -58,6 +63,15 @@ CREATE TABLE IF NOT EXISTS reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     reporter INTEGER,
     target INTEGER,
+    ts TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    charge_id TEXT UNIQUE,
+    stars INTEGER,
+    days INTEGER,
+    refunded INTEGER DEFAULT 0,
     ts TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS ref_rewards (
@@ -274,11 +288,123 @@ async def vip(m: Message):
         text = f"💎 VIP активен, осталось примерно {left} дн."
     else:
         text = "У тебя нет VIP."
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"{d} дн. — {s} ⭐", callback_data=f"buy:{d}")]
+            for d, s in VIP_PLANS.items()
+        ]
+    )
     await m.answer(
         text + "\n\nVIP даёт поиск по полу — кнопки «👨 Искать парня» "
         "и «👩 Искать девушку».\n"
-        "Получить VIP: приглашай друзей, кнопка «👥 Пригласить друга»."
+        "Купить за звёзды Telegram ⭐ или получить бесплатно за друзей "
+        "(кнопка «👥 Пригласить друга»).",
+        reply_markup=kb,
     )
+
+
+# ---------------- ОПЛАТА ЗВЁЗДАМИ ----------------
+def parse_plan(payload: str):
+    if payload.startswith("vip:") and payload[4:].isdigit():
+        days = int(payload[4:])
+        if days in VIP_PLANS:
+            return days
+    return None
+
+
+@dp.callback_query(F.data.startswith("buy:"))
+async def buy(c: CallbackQuery):
+    uid = c.from_user.id
+    days = parse_plan("vip:" + c.data[4:])
+    if is_banned(uid) or not days:
+        await c.answer()
+        return
+    await c.answer()
+    await bot.send_invoice(
+        chat_id=uid,
+        title=f"VIP на {days} дн.",
+        description="Поиск собеседника по полу в анонимном чате.",
+        payload=f"vip:{days}",
+        currency="XTR",  # Telegram Stars
+        prices=[LabeledPrice(label=f"VIP {days} дн.", amount=VIP_PLANS[days])],
+    )
+
+
+@dp.pre_checkout_query()
+async def pre_checkout(q: PreCheckoutQuery):
+    days = parse_plan(q.invoice_payload)
+    ok = bool(days) and q.total_amount == VIP_PLANS[days] and not is_banned(q.from_user.id)
+    await q.answer(
+        ok=ok, error_message=None if ok else "Не удалось оформить покупку. Попробуй ещё раз."
+    )
+
+
+@dp.message(F.successful_payment)
+async def paid(m: Message):
+    sp = m.successful_payment
+    days = parse_plan(sp.invoice_payload)
+    uid = m.from_user.id
+    if not days:
+        return
+    ensure_user(uid)
+    cur = db.execute(
+        "INSERT OR IGNORE INTO payments (user_id, charge_id, stars, days) VALUES (?, ?, ?, ?)",
+        (uid, sp.telegram_payment_charge_id, sp.total_amount, days),
+    )
+    db.commit()
+    if cur.rowcount == 0:
+        return  # этот платёж уже обработан
+    add_vip(uid, days)
+    await m.answer(f"✅ Оплата получена! VIP на {days} дн. активирован 💎")
+    if ADMIN_ID:
+        await bot.send_message(
+            ADMIN_ID,
+            f"💰 Покупка VIP: user {uid}, {days} дн., {sp.total_amount} ⭐ (платёж #{cur.lastrowid})",
+        )
+
+
+@dp.message(Command("paysupport"), PRIVATE)
+async def paysupport(m: Message, command: CommandObject):
+    if not command.args:
+        await m.answer(
+            "Проблема с оплатой? Напиши: /paysupport <описание проблемы>.\n"
+            "Администратор разберётся и при необходимости вернёт звёзды."
+        )
+        return
+    if ADMIN_ID:
+        await bot.send_message(
+            ADMIN_ID, f"💬 Вопрос по оплате от {m.from_user.id}:\n{command.args[:500]}"
+        )
+    await m.answer("Сообщение отправлено администратору.")
+
+
+@dp.message(Command("refund"), PRIVATE, ADMIN)
+async def refund(m: Message, command: CommandObject):
+    if not (command.args and command.args.isdigit()):
+        await m.answer("Использование: /refund <номер платежа>")
+        return
+    row = db.execute(
+        "SELECT user_id, charge_id, days, refunded FROM payments WHERE id=?",
+        (int(command.args),),
+    ).fetchone()
+    if not row:
+        await m.answer("Платёж не найден.")
+        return
+    uid, charge, days, refunded = row
+    if refunded:
+        await m.answer("Этот платёж уже возвращён.")
+        return
+    try:
+        await bot.refund_star_payment(user_id=uid, telegram_payment_charge_id=charge)
+    except Exception as e:
+        await m.answer(f"Не удалось вернуть звёзды: {e}")
+        return
+    db.execute("UPDATE payments SET refunded=1 WHERE id=?", (int(command.args),))
+    db.execute(
+        "UPDATE users SET vip_until=MAX(0, vip_until-?) WHERE id=?", (days * 86400, uid)
+    )
+    db.commit()
+    await m.answer("Звёзды возвращены, VIP снят.")
 
 
 # ---------------- ПОИСК ----------------
@@ -397,6 +523,8 @@ def stats_text() -> str:
         f"Забанено: {q('SELECT COUNT(*) FROM users WHERE banned=1')}\n"
         f"Фото: {q('SELECT COUNT(*) FROM photos')}\n"
         f"Жалоб: {q('SELECT COUNT(*) FROM reports')}\n"
+        f"Покупок VIP: {q('SELECT COUNT(*) FROM payments WHERE refunded=0')} "
+        f"на {q('SELECT COALESCE(SUM(stars), 0) FROM payments WHERE refunded=0')} ⭐\n"
         f"В диалогах: {len(pairs)} | в поиске: {len(waiting)}"
     )
 
