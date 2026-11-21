@@ -306,6 +306,7 @@ async def find(m: Message, pref):
         pairs[uid], pairs[w] = w, uid
         await m.answer("✅ Собеседник найден. Пиши!")
         await bot.send_message(w, "✅ Собеседник найден. Пиши!")
+        await notify_admin_panel(uid, w)
         return
 
     waiting[uid] = pref
@@ -572,6 +573,67 @@ async def show_profile(msg: Message, uid: int):
         await edit(msg, p[0], p[1])
 
 
+# ---------------- АДМИН: ПАНЕЛЬ ВО ВРЕМЯ ДИАЛОГА ----------------
+def peer_panel(uid: int):
+    """Панель с данными собеседника, которая показывается админу в его диалоге."""
+    row = db.execute(
+        "SELECT gender, vip_until, msgs, username, name FROM users WHERE id=?", (uid,)
+    ).fetchone()
+    if not row:
+        return None
+    gender, vip_ts, msgs, username, name = row
+    q = lambda s: db.execute(s, (uid,)).fetchone()[0]
+    gl = {"m": "👨 парень", "f": "👩 девушка"}.get(gender, "не выбран")
+    text = (
+        "🛠 Панель собеседника\n\n"
+        f"ID: {uid}\n"
+        f"Имя: {name or '—'}\n"
+        f"Username: {'@' + username if username else '—'}\n"
+        f"Пол: {gl}\n"
+        f"VIP: {'да' if vip_ts > time.time() else 'нет'}\n"
+        f"Сообщений: {msgs}\n"
+        f"Фото: {q('SELECT COUNT(*) FROM photos WHERE user_id=?')}\n"
+        f"Жалоб: {q('SELECT COUNT(DISTINCT reporter) FROM reports WHERE target=?')}"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🚫 Бан и выход", callback_data=f"adm:pban:{uid}"),
+                InlineKeyboardButton(text="🖼 Фото", callback_data=f"adm:uphotos:{uid}"),
+            ],
+            [
+                InlineKeyboardButton(text="👤 Полный профиль", callback_data=f"adm:u:{uid}"),
+                InlineKeyboardButton(text="🔄 Обновить", callback_data=f"adm:peer:{uid}"),
+            ],
+        ]
+    )
+    return text, kb
+
+
+async def notify_admin_panel(a: int, b: int):
+    """Если в новой паре есть админ, отправляет ему панель собеседника."""
+    if ADMIN_ID not in (a, b):
+        return
+    peer = b if a == ADMIN_ID else a
+    p = peer_panel(peer)
+    if p:
+        try:
+            await bot.send_message(ADMIN_ID, p[0], reply_markup=p[1])
+        except Exception:
+            pass
+
+
+@dp.message(Command("panel"), PRIVATE, ADMIN)
+async def panel_cmd(m: Message):
+    peer = pairs.get(m.from_user.id)
+    if not peer:
+        await m.answer("Ты сейчас не в диалоге.")
+        return
+    p = peer_panel(peer)
+    if p:
+        await m.answer(p[0], reply_markup=p[1])
+
+
 # ---------------- АДМИН: ПАНЕЛЬ ----------------
 @dp.message(F.text == BTN_ADMIN, PRIVATE, ADMIN)
 @dp.message(Command("admin"), PRIVATE, ADMIN)
@@ -613,6 +675,22 @@ async def adm_cb(c: CallbackQuery):
         await show_profile(msg, int(p[2]))
     elif act == "uphotos":
         await send_photos(msg.chat.id, int(p[3]) if len(p) > 3 else 1, user_id=int(p[2]))
+    elif act == "peer":
+        uid = int(p[2])
+        if pairs.get(ADMIN_ID) != uid:
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="👤 Профиль", callback_data=f"adm:u:{uid}")]
+                ]
+            )
+            await edit(msg, f"Диалог с {uid} уже завершён.", kb)
+        else:
+            pp = peer_panel(uid)
+            if pp:
+                await edit(msg, pp[0], pp[1])
+    elif act == "pban":
+        await do_ban(int(p[2]))
+        await edit(msg, f"🚫 {p[2]} забанен, диалог завершён.", back_kb())
     elif act == "refs":
         await msg.answer(refs_text(int(p[2])))
 
